@@ -1,0 +1,24 @@
+{
+  // The default for a repo with no devcontainer.json of its own. `up` copies
+  // it to data/state/<name>/devcontainer.json and passes it with
+  // --override-config --no-lockfile, so nothing is written into the checkout.
+  // Plain Dev Container spec, so the copy also works as a repo's own
+  // .devcontainer/devcontainer.json in a real Codespace.
+  "name": "@CODESPACE_NAME@",
+
+  // Pinned, as in the NixOS sibling: the bare `:ubuntu` tag has moved under
+  // us before. No hyphen: `ubuntu-26.04` is a 404. Multi-arch (amd64, arm64),
+  // which this project needs (CLAUDE.md §2).
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu26.04",
+
+  "remoteUser": "vscode",
+
+  // A real init as PID 1, so processes the editor and its terminals leave
+  // behind are reaped instead of piling up as zombies.
+  "init": true,
+
+  "features": {
+    // gh, for the GH_TOKEN resolved from the secrets (Phase 2).
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  }
+}

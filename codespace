@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# codespace — GitHub Codespaces-like dev environments on any Ubuntu host.
+#
+# The whole install is the folder this script lives in. Editors listen on
+# 127.0.0.1 only; reach them with an SSH tunnel (`codespace tunnel`).
+#
+#   codespace setup                      check this host, download pinned tools
+#   codespace install-docker             install docker.io from apt (warns first)
+#   codespace up <repo|name> [--name N]  create or start a codespace
+#   codespace new <name>                 an empty workspace, no repo
+#   codespace list                       name, state, port
+#   codespace shell <name> [-- cmd]      a terminal in the workspace
+#   codespace down <name>                stop it; the container is kept
+#   codespace rebuild <name>             recreate the container, same port
+#   codespace rm <name> [--repo]         delete the container (and checkout)
+#   codespace logs <name>                editor log, when the page won't load
+#   codespace status [name]              caps, disk, editor health
+#   codespace sync <name>                re-push secrets and config
+#   codespace ssh-auth <name>            unlock SSH_KEY into the agent
+#   codespace tunnel [name]              the ssh -L line for your PC
+#   codespace update                     move tools to the manifest's versions
+#   codespace gc                         remove codespaces idle past RETENTION_DAYS
+#   codespace uninstall [--yes]          remove everything this created
+#
+# <repo> is owner/repo, github.com/owner/repo, or any git URL.
+# Config: .portable-codespaces/config in this folder (see config.example).
+
+# Scaffold only: the paths and helpers below are defined ahead of the commands
+# that use them. Remove this line in Phase 1, once they are used. (A file-wide
+# directive must come before the first command, so it sits above `set`.)
+# shellcheck disable=SC2034,SC2329
+
+set -euo pipefail
+
+# The install folder: wherever this file really is, so a symlink to it from
+# ~/.local/bin still finds its lib/, apps/ and data/.
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+LIB="$ROOT/lib"
+APPS="$ROOT/apps"
+DATA="$ROOT/data"
+STATE="$DATA/state"
+WORKSPACES="$DATA/workspaces"
+MANIFEST="$ROOT/manifest"
+# A directory with a distinctive name rather than a bare ./config, because it
+# is sourced (CLAUDE.md §7).
+CONF_DIR="$ROOT/.portable-codespaces"
+# Everything we create in Docker carries this label, and only labelled things
+# are ever removed (CLAUDE.md §5).
+LABEL=portable-codespaces
+
+die() { echo "codespace: $*" >&2; exit 1; }
+warn() { echo "codespace: warning: $*" >&2; }
+note() { echo "==> $*" >&2; }
+
+# The header comment is the usage text, so the two cannot drift apart.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
+
+load_config() {
+  # The user's own file, so sourcing it is fine.
+  # shellcheck source=/dev/null
+  [ -r "$CONF_DIR/config" ] && . "$CONF_DIR/config"
+  MODE="${MODE:-host}"
+  PORT_BASE="${PORT_BASE:-9001}"
+  PORT_COUNT="${PORT_COUNT:-20}"
+  CPU_MAX="${CPU_MAX:-50%}"
+  CPU_WEIGHT="${CPU_WEIGHT:-10}"
+  MEM_MAX="${MEM_MAX:-40%}"
+  PIDS_MAX="${PIDS_MAX:-4096}"
+  OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-500}"
+  DISK_FLOOR_GB="${DISK_FLOOR_GB:-10}"
+  DISK_FLOOR_PCT="${DISK_FLOOR_PCT:-15}"
+  RETENTION_DAYS="${RETENTION_DAYS:-30}"
+  AUTOSTART="${AUTOSTART:-0}"
+  DEFAULT_IMAGE="${DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base:ubuntu26.04}"
+
+  case "$MODE" in host|isolated) ;; *) die "MODE must be host or isolated, not '$MODE'" ;; esac
+  case "$AUTOSTART" in 0|1) ;; *) die "AUTOSTART must be 0 or 1, not '$AUTOSTART'" ;; esac
+  local v
+  for v in PORT_BASE PORT_COUNT CPU_WEIGHT PIDS_MAX DISK_FLOOR_GB DISK_FLOOR_PCT RETENTION_DAYS; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a whole number, not '${!v}'"
+  done
+  [[ "$OOM_SCORE_ADJ" =~ ^-?[0-9]+$ ]] && [ "$OOM_SCORE_ADJ" -ge -1000 ] && [ "$OOM_SCORE_ADJ" -le 1000 ] \
+    || die "OOM_SCORE_ADJ must be between -1000 and 1000, not '$OOM_SCORE_ADJ'"
+  # An editor must never land on a port below 1024 or past 65535.
+  [ "$PORT_BASE" -ge 1024 ] && [ $((PORT_BASE + PORT_COUNT - 1)) -le 65535 ] \
+    || die "PORT_BASE..PORT_BASE+PORT_COUNT-1 must lie within 1024-65535"
+  for v in CPU_MAX MEM_MAX; do
+    [[ "${!v}" =~ ^([1-9][0-9]?|100)%$ ]] || die "$v must be a percentage from 1% to 100%, not '${!v}'"
+  done
+  return 0
+}
+
+# The manifest's name for this machine's architecture. Anything else is
+# refused rather than guessed: there is no emulation fallback (CLAUDE.md §2).
+host_arch() {
+  case "$(uname -m)" in
+    x86_64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) die "unsupported architecture $(uname -m): only x86_64 and arm64 are" ;;
+  esac
+}
+
+# The manifest line for a tool on this architecture, as "version sha256 url".
+# An `any` line serves every architecture; an exact one wins over it.
+manifest_entry() {
+  local tool=$1 arch; arch=$(host_arch)
+  awk -v t="$tool" -v a="$arch" '
+    /^[[:space:]]*(#|$)/ { next }
+    $1 == t && $3 == a   { exact = $2 " " $4 " " $5 }
+    $1 == t && $3 == "any" { any = $2 " " $4 " " $5 }
+    END { if (exact != "") print exact; else if (any != "") print any; else exit 1 }
+  ' "$MANIFEST" || die "manifest has no $tool for $arch"
+}
+
+# Codespace names become directory names, container labels and volume-name
+# parts. A leading dot would hide one from every glob (NixOS sibling §8), and
+# `refs` is /workspaces/refs.
+validate_name() {
+  local n=$1
+  [[ "$n" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] \
+    || die "invalid codespace name '$n': lowercase letters, digits and '-', starting with a letter or digit"
+  [ "$n" != refs ] || die "'refs' is reserved for /workspaces/refs"
+}
+
+not_yet() { die "'$1' is not implemented yet (Phase $2, CLAUDE.md §9)"; }
+
+main() {
+  [ $# -gt 0 ] || usage
+  local cmd=$1; shift
+  case "$cmd" in
+    -h|--help|help) usage 0 ;;
+  esac
+  load_config
+  case "$cmd" in
+    setup|up|new|list|shell|down|rebuild|rm|logs|status|tunnel) not_yet "$cmd" 1 ;;
+    sync|ssh-auth)                                              not_yet "$cmd" 2 ;;
+    install-docker|update|gc|uninstall)                         not_yet "$cmd" 3 ;;
+    *) echo "codespace: unknown command '$cmd'" >&2; usage ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,6 @@
+# Run-time state of an install, never committed (see CLAUDE.md §7).
+/apps/
+/bin/
+/data/
+# Config and secrets live inside the install folder.
+/.portable-codespaces/

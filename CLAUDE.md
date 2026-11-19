@@ -72,8 +72,10 @@ generated outside the checkout and passed with `--override-config
 - The tools:
   - **Node**: official tarball, used only to run the devcontainer CLI. The
     apt `nodejs` package is too old on some releases.
-  - **devcontainer CLI**: installed with `npm --prefix` into its own app
-    directory.
+  - **devcontainer CLI**: the npm registry tarball, verified and unpacked
+    as-is. The package has no dependencies, so no `npm install` runs and
+    nothing is fetched unverified. If a release ever gains dependencies,
+    stop and rethink rather than reaching for `npm install`.
   - **code-server**: standalone release tarball.
 - `codespace update` moves tools to newer pinned versions. Old versions are
   kept until `gc` finds no codespace using them.

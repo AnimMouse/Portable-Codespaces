@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# docker-wrapper — the `docker` the devcontainer CLI is given (--docker-path).
+#
+# Passes everything through to the real docker, except that every container
+# the devcontainer CLI creates must carry our label and land in our capped
+# cgroup (CLAUDE.md §5): --label, --cgroup-parent, --oom-score-adj,
+# --pids-limit, and the image platform check.
+#
+# Until that is written (Phase 1), `run` and `create` are refused. Failing
+# closed is the point: a container that misses the caps on a production host
+# is the one outcome §5 rules out.
+
+set -euo pipefail
+
+# The real docker, never this script again. CODESPACE_DOCKER may name it
+# explicitly; otherwise the first `docker` on PATH that is not us.
+real_docker() {
+  local self d
+  self=$(readlink -f "$0")
+  if [ -n "${CODESPACE_DOCKER:-}" ]; then echo "$CODESPACE_DOCKER"; return; fi
+  while IFS= read -r d; do
+    [ "$(readlink -f "$d")" = "$self" ] || { echo "$d"; return; }
+  done < <(type -ap docker)
+  echo "docker-wrapper: no docker found on PATH" >&2
+  exit 127
+}
+
+DOCKER=$(real_docker)
+
+case "${1:-}" in
+  run|create)
+    echo "docker-wrapper: '$1' is refused until the caps are implemented (Phase 1)" >&2
+    exit 1
+    ;;
+  container)
+    case "${2:-}" in
+      run|create)
+        echo "docker-wrapper: 'container $2' is refused until the caps are implemented (Phase 1)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+esac
+
+exec "$DOCKER" "$@"

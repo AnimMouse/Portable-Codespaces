@@ -1,0 +1,62 @@
+# Portable-Codespaces config: copy to .portable-codespaces/config in this
+# folder (gitignored), then edit. Plain shell assignments, sourced by
+# `codespace`; every line is optional and shows its default.
+
+# host (default): codespaces run on this machine's own Docker, everything we
+# create labelled `portable-codespaces`. The choice for production.
+# isolated: our own Docker daemon (docker:dind) in one privileged container,
+# its data in data/docker/. Fully contained, but a codespace that escapes its
+# container reaches a privileged one. See CLAUDE.md §3.
+#MODE=host
+
+# --- Editor ports ----------------------------------------------------------
+# Editors listen on 127.0.0.1:PORT_BASE .. PORT_BASE+PORT_COUNT-1, reached
+# through `ssh -L` (`codespace tunnel` prints it). Give each host its own
+# range, so ports tunnelled to your PC don't collide with each other or with
+# the NixOS VM's 8001-8020: e.g. 9001 on a VPS, 9101 on the Pi.
+#PORT_BASE=9001
+#PORT_COUNT=20
+
+# --- Resource caps (CLAUDE.md §5) ------------------------------------------
+# For all codespaces together, not each one. Production keeps the rest.
+# Percentages are of this machine's CPUs and RAM. On the Pi, which is not
+# production, something like CPU_MAX=100% and MEM_MAX=75% is reasonable.
+#CPU_MAX=50%
+# cgroup v2 cpu.weight, 1-10000; the default for everything else is 100, so a
+# low value means production wins whenever both want the CPU.
+#CPU_WEIGHT=10
+#MEM_MAX=40%
+#PIDS_MAX=4096
+# -1000..1000: higher is killed first when the whole machine runs out of
+# memory. 500 puts codespaces well ahead of ordinary processes.
+#OOM_SCORE_ADJ=500
+
+# --- Disk ------------------------------------------------------------------
+# up, rebuild and update refuse to run when the filesystem holding Docker's
+# data has less free than the larger of these two.
+#DISK_FLOOR_GB=10
+#DISK_FLOOR_PCT=15
+# gc removes codespaces unused for this many days, as Codespaces does.
+#RETENTION_DAYS=30
+
+# --- Boot ------------------------------------------------------------------
+# 0 (default): nothing of ours starts at boot; `codespace up <name>` brings a
+# codespace back. 1 restarts codespaces with the machine; meant for the Pi.
+#AUTOSTART=0
+
+# --- Codespaces --------------------------------------------------------------
+# Image for repos with no devcontainer.json (multi-arch: amd64 and arm64).
+#DEFAULT_IMAGE=mcr.microsoft.com/devcontainers/base:ubuntu26.04
+
+# Git identity inside codespaces.
+#GIT_NAME="Anim Mouse"
+#GIT_EMAIL=you@example.com
+
+# Dotfiles, as in Codespaces settings (Phase 2).
+#DOTFILES_REPOSITORY=AnimMouse/dotfiles-codespaces
+#DOTFILES_INSTALL_COMMAND=install.sh
+
+# An SSH key for `codespace ssh-auth`; a passphrase is fine (Phase 2).
+#SSH_KEY=$HOME/.ssh/id_ed25519
+
+#TIMEZONE=Asia/Manila

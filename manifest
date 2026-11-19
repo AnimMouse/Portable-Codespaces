@@ -1,0 +1,27 @@
+# Pinned tools, Scoop-bucket style: everything Portable-Codespaces needs that
+# apt does not provide. `codespace setup` downloads each tool for this host's
+# architecture into apps/<tool>/<version>/, refuses it unless the sha256
+# matches, and points apps/<tool>/current at it.
+#
+# One line per tool, version and architecture, whitespace-separated:
+#
+#   tool  version  arch  sha256  url
+#
+# arch is amd64, arm64, or `any` for an architecture-independent download.
+# Bump a version by replacing its lines, never by editing a URL alone: the
+# sha256 must come from the publisher (SHASUMS256.txt, the GitHub release
+# digest), not from hashing whatever the URL serves today.
+
+# Node.js, only to run the devcontainer CLI. The newest LTS line; the CLI
+# needs >= 20. Hashes: https://nodejs.org/dist/v26.13.1/SHASUMS256.txt
+node            26.13.1  amd64  5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864  https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.xz
+node            26.13.1  arm64  89e1853138db51e8b82d3e98ba9c0d3f2956a28e5e55ea1b7e12d25aae92d5dd  https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-arm64.tar.xz
+
+# The devcontainer CLI. Its npm package has no dependencies, so the registry
+# tarball is unpacked as-is: no `npm install`, nothing fetched unverified.
+devcontainer    0.90.0   any    b3d40fec9d274a303a29ea91a24852887cf287701bc8d340bfc1cf970542495a  https://registry.npmjs.org/@devcontainers/cli/-/cli-0.90.0.tgz
+
+# code-server, unpacked once per version, made immutable, and mounted into
+# every container (CLAUDE.md §3). Hashes: the release assets' sha256 digests.
+code-server     4.145.2  amd64  2f6db6c3e8b733dd6b3aeee83532e148b2bae2e392353ba85452d03572348962  https://github.com/coder/code-server/releases/download/v4.145.2/code-server-4.145.2-linux-amd64.tar.gz
+code-server     4.145.2  arm64  e867a34416e2da4a83496b09580001893e7a4e5bb58a0624c4fcd22819e7d53d  https://github.com/coder/code-server/releases/download/v4.145.2/code-server-4.145.2-linux-arm64.tar.gz
