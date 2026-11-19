@@ -25,28 +25,36 @@
 # <repo> is owner/repo, github.com/owner/repo, or any git URL.
 # Config: .portable-codespaces/config in this folder (see config.example).
 
-# Scaffold only: the paths and helpers below are defined ahead of the commands
-# that use them. Remove this line in Phase 1, once they are used. (A file-wide
-# directive must come before the first command, so it sits above `set`.)
-# shellcheck disable=SC2034,SC2329
-
 set -euo pipefail
 
 # The install folder: wherever this file really is, so a symlink to it from
 # ~/.local/bin still finds its lib/, apps/ and data/.
-ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
 LIB="$ROOT/lib"
 APPS="$ROOT/apps"
+BIN="$ROOT/bin"
 DATA="$ROOT/data"
 STATE="$DATA/state"
 WORKSPACES="$DATA/workspaces"
+REFS="$DATA/refs"
 MANIFEST="$ROOT/manifest"
+WRAPPER="$LIB/docker-wrapper"
 # A directory with a distinctive name rather than a bare ./config, because it
 # is sourced (CLAUDE.md §7).
 CONF_DIR="$ROOT/.portable-codespaces"
 # Everything we create in Docker carries this label, and only labelled things
 # are ever removed (CLAUDE.md §5).
 LABEL=portable-codespaces
+NETWORK=portable-codespaces
+# The systemd slice every codespace container is placed in, so the caps apply
+# to all of them together. No dash in the name: in systemd, `a-b.slice` is a
+# child of `a.slice`, which would put us under a parent we don't own.
+SLICE=portablecodespaces.slice
+# code-server's port inside the container. Only the host side is published,
+# on 127.0.0.1:<the codespace's port>.
+EDITOR_PORT=13370
+# The tools `setup` installs, in this order.
+TOOLS=(node devcontainer code-server)
 
 die() { echo "codespace: $*" >&2; exit 1; }
 warn() { echo "codespace: warning: $*" >&2; }
@@ -71,24 +79,41 @@ load_config() {
   DISK_FLOOR_PCT="${DISK_FLOOR_PCT:-15}"
   RETENTION_DAYS="${RETENTION_DAYS:-30}"
   AUTOSTART="${AUTOSTART:-0}"
+  ALLOW_HOST_ACCESS="${ALLOW_HOST_ACCESS:-0}"
   DEFAULT_IMAGE="${DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base:ubuntu26.04}"
 
-  case "$MODE" in host|isolated) ;; *) die "MODE must be host or isolated, not '$MODE'" ;; esac
-  case "$AUTOSTART" in 0|1) ;; *) die "AUTOSTART must be 0 or 1, not '$AUTOSTART'" ;; esac
+  case "$MODE" in
+    host) ;;
+    isolated) die "MODE=isolated is not implemented yet (Phase 3, CLAUDE.md §9)" ;;
+    *) die "MODE must be host or isolated, not '$MODE'" ;;
+  esac
+  case "$AUTOSTART" in
+    0) ;;
+    # Docker would restart the containers at boot, before anything has put
+    # the --runtime caps back on the slice: uncapped codespaces on a
+    # production host. Not until that ordering is solved (CLAUDE.md §3).
+    1) die "AUTOSTART=1 is not implemented yet: the caps do not survive a reboot (CLAUDE.md §3)" ;;
+    *) die "AUTOSTART must be 0 or 1, not '$AUTOSTART'" ;;
+  esac
+  case "$ALLOW_HOST_ACCESS" in 0|1) ;; *) die "ALLOW_HOST_ACCESS must be 0 or 1" ;; esac
   local v
   for v in PORT_BASE PORT_COUNT CPU_WEIGHT PIDS_MAX DISK_FLOOR_GB DISK_FLOOR_PCT RETENTION_DAYS; do
     [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a whole number, not '${!v}'"
   done
+  [ "$CPU_WEIGHT" -ge 1 ] && [ "$CPU_WEIGHT" -le 10000 ] || die "CPU_WEIGHT must be 1-10000"
+  [ "$PIDS_MAX" -ge 64 ] || die "PIDS_MAX must be at least 64"
   [[ "$OOM_SCORE_ADJ" =~ ^-?[0-9]+$ ]] && [ "$OOM_SCORE_ADJ" -ge -1000 ] && [ "$OOM_SCORE_ADJ" -le 1000 ] \
     || die "OOM_SCORE_ADJ must be between -1000 and 1000, not '$OOM_SCORE_ADJ'"
   # An editor must never land on a port below 1024 or past 65535.
-  [ "$PORT_BASE" -ge 1024 ] && [ $((PORT_BASE + PORT_COUNT - 1)) -le 65535 ] \
+  [ "$PORT_COUNT" -ge 1 ] && [ "$PORT_BASE" -ge 1024 ] && [ $((PORT_BASE + PORT_COUNT - 1)) -le 65535 ] \
     || die "PORT_BASE..PORT_BASE+PORT_COUNT-1 must lie within 1024-65535"
   for v in CPU_MAX MEM_MAX; do
     [[ "${!v}" =~ ^([1-9][0-9]?|100)%$ ]] || die "$v must be a percentage from 1% to 100%, not '${!v}'"
   done
   return 0
 }
+
+# --- Host facts ----------------------------------------------------------------
 
 # The manifest's name for this machine's architecture. Anything else is
 # refused rather than guessed: there is no emulation fallback (CLAUDE.md §2).
@@ -99,6 +124,57 @@ host_arch() {
     *) die "unsupported architecture $(uname -m): only x86_64 and arm64 are" ;;
   esac
 }
+
+need_cmds() {
+  local c missing=()
+  for c in "$@"; do command -v "$c" >/dev/null || missing+=("$c"); done
+  [ ${#missing[@]} -eq 0 ] || die "missing: ${missing[*]} (sudo apt-get install ${missing[*]/xz/xz-utils})"
+}
+
+# Docker installed, running, and usable by this user.
+require_docker() {
+  command -v docker >/dev/null || die "Docker is not installed. On a disposable host: codespace install-docker"
+  local err
+  if ! err=$(docker info --format '{{.ServerVersion}}' 2>&1 >/dev/null); then
+    case "$err" in
+      *"permission denied"*) die "this user cannot reach Docker: sudo usermod -aG docker $(id -un), then log in again" ;;
+      *) die "Docker is not answering: $err" ;;
+    esac
+  fi
+}
+
+# The caps are a systemd slice, so docker must place containers with the
+# systemd cgroup driver on cgroup v2. Ubuntu's docker.io does so by default;
+# anything else is refused rather than run uncapped.
+require_cgroup() {
+  local info
+  info=$(docker info --format '{{.CgroupDriver}} {{.CgroupVersion}}')
+  [ "$info" = "systemd 2" ] \
+    || die "Docker reports cgroup driver/version '$info'; Portable-Codespaces needs 'systemd 2' to enforce its caps (CLAUDE.md §5)"
+}
+
+# Free bytes, and the floor in bytes, on the filesystem holding Docker's data.
+# /var/lib/docker is root-only, but df only needs to reach it, not list it.
+disk_check() {
+  local root avail size floor_pct floor_gb floor
+  root=$(docker info --format '{{.DockerRootDir}}')
+  read -r avail size < <(df -B1 --output=avail,size "$root" | tail -n 1)
+  floor_pct=$((size * DISK_FLOOR_PCT / 100))
+  floor_gb=$((DISK_FLOOR_GB * 1024 * 1024 * 1024))
+  floor=$((floor_pct > floor_gb ? floor_pct : floor_gb))
+  echo "$avail $floor $root"
+}
+
+require_disk() {
+  local avail floor root
+  read -r avail floor root < <(disk_check)
+  [ "$avail" -ge "$floor" ] \
+    || die "only $((avail / 1024 / 1024 / 1024)) GiB free under $root; the floor is $((floor / 1024 / 1024 / 1024)) GiB (DISK_FLOOR_GB / DISK_FLOOR_PCT). Free space first: production comes first"
+}
+
+port_in_use() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
+
+# --- Tools (Scoop-style, CLAUDE.md §3) -------------------------------------------
 
 # The manifest line for a tool on this architecture, as "version sha256 url".
 # An `any` line serves every architecture; an exact one wins over it.
@@ -112,6 +188,123 @@ manifest_entry() {
   ' "$MANIFEST" || die "manifest has no $tool for $arch"
 }
 
+# Download, verify, unpack, then rename into place: apps/<tool>/<version>
+# either exists complete and verified, or not at all.
+install_tool() {
+  local tool=$1 version sha url dest stage
+  read -r version sha url < <(manifest_entry "$tool")
+  dest="$APPS/$tool/$version"
+  if [ -d "$dest" ]; then
+    note "$tool $version: already installed"
+  else
+    note "$tool $version: downloading"
+    mkdir -p "$APPS/$tool"
+    stage=$(mktemp -d "$APPS/.stage-$tool.XXXXXX")
+    # shellcheck disable=SC2064 # expand now: $stage is local
+    trap "rm -rf '$stage'" EXIT
+    curl -fsSL --retry 3 -o "$stage/download" "$url" || die "$tool: download failed: $url"
+    echo "$sha  $stage/download" | sha256sum --check --quiet --strict \
+      || die "$tool: sha256 mismatch for $url; refusing it"
+    mkdir "$stage/unpacked"
+    # Every tarball here has one top-level directory (node-v…/, package/,
+    # code-server-…/); its contents become the version directory.
+    tar -xf "$stage/download" -C "$stage/unpacked" --strip-components=1 --no-same-owner \
+      || die "$tool: could not unpack $url"
+    mv -T "$stage/unpacked" "$dest"
+    rm -rf "$stage"
+    trap - EXIT
+  fi
+  ln -sfn "$version" "$APPS/$tool/current"
+  [ "$tool" != code-server ] || make_immutable "$dest"
+}
+
+# code-server is mounted into every container. The mount is read-only, and
+# the immutable bit is the second lock: even container root with the mount
+# remounted could not change it without CAP_LINUX_IMMUTABLE (NixOS sibling
+# §8). Not `chattr -R`, which fails on every symlink.
+make_immutable() {
+  local dir=$1
+  if lsattr -d "$dir" 2>/dev/null | cut -d' ' -f1 | grep -q i; then return 0; fi
+  note "making $dir immutable (sudo chattr +i)"
+  sudo find "$dir" ! -type l -exec chattr +i {} + \
+    || die "chattr +i failed on $dir; this filesystem may not support it (CLAUDE.md §9)"
+  lsattr -d "$dir" | cut -d' ' -f1 | grep -q i || die "chattr +i did not take on $dir"
+}
+
+# A shim per runnable tool, so nothing touches PATH or ~/.bashrc. Each finds
+# the install relative to itself, so the folder can move.
+write_shims() {
+  mkdir -p "$BIN"
+  cat > "$BIN/devcontainer" <<'EOF'
+#!/bin/sh
+# Generated by `codespace setup`.
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+exec "$root/apps/node/current/bin/node" "$root/apps/devcontainer/current/devcontainer.js" "$@"
+EOF
+  chmod +x "$BIN/devcontainer"
+}
+
+require_tools() {
+  local t
+  for t in "${TOOLS[@]}"; do
+    [ -e "$APPS/$t/current" ] || die "$t is not installed: run codespace setup"
+  done
+}
+
+# --- The slice: caps for all codespaces together (CLAUDE.md §5) -------------------
+
+# CPUQuota is in percent of one CPU, so 50% of 8 CPUs is 400%.
+slice_properties() {
+  local cpus mem_kb
+  cpus=$(getconf _NPROCESSORS_ONLN)
+  mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+  echo "CPUQuota=$(( ${CPU_MAX%\%} * cpus ))%"
+  echo "CPUWeight=$CPU_WEIGHT"
+  # Whole MiB, so what systemd reports back compares equal.
+  local mib=$(( mem_kb * ${MEM_MAX%\%} / 100 / 1024 ))
+  echo "MemoryMax=$(( mib * 1024 * 1024 ))"
+  # No swap: a codespace swapping under its cap would compete with production
+  # for disk I/O. Over the cap it is OOM-killed inside the slice instead.
+  echo "MemorySwapMax=0"
+  echo "TasksMax=$PIDS_MAX"
+  # Only effective where the disk's I/O scheduler honours weights; on virtio
+  # disks with `none` it is a no-op, so it is never promised (CLAUDE.md §5).
+  echo "IOWeight=10"
+}
+
+# --runtime puts the properties under /run: nothing in /etc, gone at reboot,
+# and re-applied here before any codespace container starts.
+apply_caps() {
+  local props
+  mapfile -t props < <(slice_properties)
+  note "capping $SLICE: ${props[*]}"
+  sudo systemctl set-property --runtime "$SLICE" "${props[@]}" \
+    || die "could not set the caps on $SLICE"
+  verify_caps
+}
+
+# Read the caps back from systemd rather than trusting set-property.
+verify_caps() {
+  local want_mem got_mem got_tasks
+  want_mem=$(slice_properties | sed -n 's/^MemoryMax=//p')
+  got_mem=$(systemctl show "$SLICE" -p MemoryMax --value)
+  got_tasks=$(systemctl show "$SLICE" -p TasksMax --value)
+  [ "$got_mem" = "$want_mem" ] || die "$SLICE has MemoryMax=$got_mem, expected $want_mem"
+  [ "$got_tasks" = "$PIDS_MAX" ] || die "$SLICE has TasksMax=$got_tasks, expected $PIDS_MAX"
+}
+
+# Our own bridge network, so codespaces never share one with production's
+# containers, and with inter-container traffic off, so codespaces cannot reach
+# each other's editors either.
+ensure_network() {
+  docker network inspect "$NETWORK" >/dev/null 2>&1 && return 0
+  note "creating docker network $NETWORK"
+  docker network create --label "$LABEL=network" \
+    --opt com.docker.network.bridge.enable_icc=false "$NETWORK" >/dev/null
+}
+
+# --- Codespace state -------------------------------------------------------------
+
 # Codespace names become directory names, container labels and volume-name
 # parts. A leading dot would hide one from every glob (NixOS sibling §8), and
 # `refs` is /workspaces/refs.
@@ -120,6 +313,436 @@ validate_name() {
   [[ "$n" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] \
     || die "invalid codespace name '$n': lowercase letters, digits and '-', starting with a letter or digit"
   [ "$n" != refs ] || die "'refs' is reserved for /workspaces/refs"
+}
+
+slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-*//; s/-*$//'; }
+
+# owner/repo and github.com/owner/repo become an https URL; anything else is
+# taken as a git URL as given.
+repo_url() {
+  case "$1" in
+    *://*|git@*) echo "$1" ;;
+    github.com/*) echo "https://$1" ;;
+    */*) echo "https://github.com/$1" ;;
+    *) die "'$1' is not a codespace, owner/repo, or git URL" ;;
+  esac
+}
+
+sget() { cat "$STATE/$1/$2" 2>/dev/null || true; }
+sput() { printf '%s\n' "$3" > "$STATE/$1/$2"; }
+
+require_codespace() {
+  validate_name "$1"
+  [ -d "$STATE/$1" ] || die "no codespace '$1' (codespace list)"
+}
+
+# The lowest port in the range that no codespace holds and nothing listens on.
+allocate_port() {
+  local p used
+  used=$(cat "$STATE"/*/port 2>/dev/null || true)
+  for ((p = PORT_BASE; p < PORT_BASE + PORT_COUNT; p++)); do
+    grep -qx "$p" <<< "$used" && continue
+    port_in_use "$p" && continue
+    echo "$p"; return 0
+  done
+  die "no free port in $PORT_BASE-$((PORT_BASE + PORT_COUNT - 1)); raise PORT_COUNT or remove a codespace"
+}
+
+container_of() { docker ps -aq --filter "label=$LABEL=$1" | head -n 1; }
+
+container_status() {
+  local cid; cid=$(container_of "$1")
+  [ -n "$cid" ] || { echo absent; return; }
+  docker inspect --format '{{.State.Status}}' "$cid"
+}
+
+touch_used() { sput "$1" last_used "$(date +%s)"; }
+
+# The editor answers on its port: the property worth knowing, rather than a
+# process listing (NixOS sibling §8).
+editor_healthy() { curl -fsS -m 3 "http://127.0.0.1:$1/healthz" >/dev/null 2>&1; }
+
+# --- up --------------------------------------------------------------------------
+
+# devcontainer CLI with the wrapper as its docker. Every CODESPACE_* value
+# the wrapper reads is set here, for this one call.
+devcontainer_cli() {
+  local name=$1; shift
+  CODESPACE_NAME=$name \
+  CODESPACE_PORT=$(sget "$name" port) \
+  CODESPACE_EDITOR_PORT=$EDITOR_PORT \
+  CODESPACE_CGROUP_PARENT=$SLICE \
+  CODESPACE_OOM_SCORE_ADJ=$OOM_SCORE_ADJ \
+  CODESPACE_PIDS_MAX=$PIDS_MAX \
+  CODESPACE_NETWORK=$NETWORK \
+  CODESPACE_RESTART=no \
+  CODESPACE_EDITOR_DIR=$(readlink -f "$APPS/code-server/current") \
+  CODESPACE_DATA=$DATA \
+  CODESPACE_ARCH=$(host_arch) \
+  CODESPACE_ALLOW_HOST_ACCESS=$ALLOW_HOST_ACCESS \
+  CODESPACE_DOCKER=$(command -v docker) \
+    "$BIN/devcontainer" "$@" --docker-path "$WRAPPER"
+}
+
+# The repo's own devcontainer.json, or a generated one outside the checkout
+# (never write into it, CLAUDE.md §3). Prints the override arguments, which
+# both `up` and `read-configuration` take.
+config_args() {
+  local name=$1 ws="$WORKSPACES/$1" gen="$STATE/$1/devcontainer.json"
+  if [ -f "$ws/.devcontainer/devcontainer.json" ] || [ -f "$ws/.devcontainer.json" ]; then
+    rm -f "$gen"
+    return 0
+  fi
+  if [ ! -f "$gen" ]; then
+    sed -e "s|@CODESPACE_NAME@|$name|" \
+        -e "s|\"image\": \"[^\"]*\"|\"image\": \"$DEFAULT_IMAGE\"|" \
+        "$ROOT/templates/devcontainer.json" > "$gen"
+  fi
+  printf '%s\n' --override-config "$gen"
+}
+
+# Compose-based configs create their containers through compose, which the
+# wrapper cannot cap, so they are refused up front with a clear reason.
+refuse_compose() {
+  local name=$1; shift
+  local out
+  out=$(devcontainer_cli "$name" read-configuration --workspace-folder "$WORKSPACES/$name" "$@" 2>/dev/null) \
+    || die "could not read $name's devcontainer.json (devcontainer read-configuration failed)"
+  if jq -e '.configuration.dockerComposeFile // empty' <<< "$out" >/dev/null; then
+    die "$name's devcontainer.json uses Docker Compose, which is not supported yet: its containers would run uncapped"
+  fi
+}
+
+# The checks every container start depends on, in the order that keeps
+# production safe: caps on the slice before any container can start in it.
+preflight() {
+  require_tools
+  require_docker
+  require_cgroup
+  require_disk
+  apply_caps
+  ensure_network
+  mkdir -p "$REFS"
+}
+
+# Is the running container what the wrapper should have made it? Checked
+# from docker and from the kernel. One that is not is stopped, never left
+# running uncapped (CLAUDE.md §5).
+verify_container() {
+  local name=$1 cid=$2 inspect pid cg problems=()
+  inspect=$(docker inspect "$cid")
+  jq -e --arg l "$LABEL" --arg n "$name" '.[0].Config.Labels[$l] == $n' <<< "$inspect" >/dev/null \
+    || problems+=("label $LABEL=$name missing")
+  jq -e --arg s "$SLICE" '.[0].HostConfig.CgroupParent == $s' <<< "$inspect" >/dev/null \
+    || problems+=("not in $SLICE")
+  jq -e --argjson o "$OOM_SCORE_ADJ" '.[0].HostConfig.OomScoreAdj == $o' <<< "$inspect" >/dev/null \
+    || problems+=("OomScoreAdj is not $OOM_SCORE_ADJ")
+  jq -e '.[0].HostConfig.Privileged == false' <<< "$inspect" >/dev/null || [ "$ALLOW_HOST_ACCESS" = 1 ] \
+    || problems+=("privileged")
+  # Every published port on loopback, and only the editor's.
+  jq -e --arg p "$(sget "$name" port)" --arg e "$EDITOR_PORT/tcp" '
+    (.[0].HostConfig.PortBindings // {}) as $b
+    | ($b | keys) == [$e]
+      and ($b[$e] | all(.HostIp == "127.0.0.1" and .HostPort == $p))' <<< "$inspect" >/dev/null \
+    || problems+=("published ports are not exactly 127.0.0.1:$(sget "$name" port)")
+  pid=$(jq -r '.[0].State.Pid' <<< "$inspect")
+  cg=$(cat "/proc/$pid/cgroup" 2>/dev/null || true)
+  [[ "$cg" == *"/$SLICE/"* ]] || problems+=("kernel cgroup is '${cg#0::}', not under $SLICE")
+  if [ ${#problems[@]} -gt 0 ]; then
+    docker stop "$cid" >/dev/null || true
+    die "stopped $name's container, which missed its caps: ${problems[*]}"
+  fi
+}
+
+# code-server from the read-only mount, as the container's user, in the
+# workspace folder. `docker exec -d`: the container keeps it, not this shell.
+start_editor() {
+  local name=$1 cid port user folder
+  cid=$(container_of "$name")
+  port=$(sget "$name" port)
+  if editor_healthy "$port"; then return 0; fi
+  user=$(sget "$name" remote_user)
+  folder=$(sget "$name" remote_folder)
+  note "starting the editor"
+  docker exec -d -u "$user" -w "$folder" -e "CS_FOLDER=$folder" -e "CS_PORT=$EDITOR_PORT" "$cid" \
+    sh -lc 'exec /opt/code-server/bin/code-server --bind-addr "0.0.0.0:$CS_PORT" --auth none \
+              --disable-telemetry --disable-update-check "$CS_FOLDER" \
+              >>"$HOME/.codespace-editor.log" 2>&1'
+  local _
+  for _ in $(seq 1 60); do
+    editor_healthy "$port" && return 0
+    sleep 1
+  done
+  die "the editor did not answer on 127.0.0.1:$port within 60s (codespace logs $name)"
+}
+
+# Create or start: the shared path of up, new and rebuild.
+bring_up() {
+  local name=$1; shift
+  local -a cfg
+  mapfile -t cfg < <(config_args "$name")
+  preflight
+  refuse_compose "$name" "${cfg[@]}"
+  note "starting $name (devcontainer up)"
+  # --no-lockfile with a generated config: the CLI would otherwise write a
+  # lockfile into the checkout's .devcontainer/ (NixOS sibling §8). Only `up`
+  # takes it; `read-configuration` refuses it.
+  [ ${#cfg[@]} -eq 0 ] || cfg+=(--no-lockfile)
+  local out result
+  out=$(devcontainer_cli "$name" up \
+          --workspace-folder "$WORKSPACES/$name" \
+          --id-label "$LABEL=$name" \
+          --mount "type=bind,source=$REFS,target=/workspaces/refs" \
+          "${cfg[@]}" "$@") \
+    || die "devcontainer up failed for $name"
+  result=$(tail -n 1 <<< "$out")
+  jq -e '.outcome == "success"' <<< "$result" >/dev/null \
+    || die "devcontainer up did not succeed: $result"
+  sput "$name" remote_user "$(jq -r '.remoteUser' <<< "$result")"
+  sput "$name" remote_folder "$(jq -r '.remoteWorkspaceFolder' <<< "$result")"
+  verify_container "$name" "$(jq -r '.containerId' <<< "$result")"
+  start_editor "$name"
+  touch_used "$name"
+  local port; port=$(sget "$name" port)
+  note "$name is ready: http://localhost:$port/  (tunnel: codespace tunnel $name)"
+}
+
+# Make the state directory and claim a port, unless the codespace exists.
+claim() {
+  local name=$1
+  [ -d "$STATE/$name" ] && return 0
+  mkdir -p "$STATE/$name"
+  sput "$name" port "$(allocate_port)"
+  sput "$name" created "$(date +%s)"
+}
+
+cmd_up() {
+  local arg="" name="" url
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=${2:?--name needs a value}; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$arg" ] || die "one repo or name at a time"; arg=$1; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || usage
+  # An existing codespace: just start it.
+  if [ -z "$name" ] && [[ "$arg" =~ ^[a-z0-9][a-z0-9-]*$ ]] && [ -d "$STATE/$arg" ]; then
+    bring_up "$arg"; return
+  fi
+  url=$(repo_url "$arg")
+  [ -n "$name" ] || name=$(slugify "$(basename "${url%.git}")")
+  validate_name "$name"
+  if [ -d "$STATE/$name" ]; then
+    [ "$(sget "$name" source)" = "$url" ] \
+      || die "codespace '$name' already exists for $(sget "$name" source); pick another --name"
+  fi
+  need_cmds git
+  local fresh=0
+  [ -d "$STATE/$name" ] || fresh=1
+  claim "$name"
+  sput "$name" source "$url"
+  if [ ! -d "$WORKSPACES/$name" ]; then
+    note "cloning $url"
+    mkdir -p "$WORKSPACES"
+    if ! git clone --quiet -- "$url" "$WORKSPACES/$name"; then
+      # Give the port back, but only for a codespace this call created.
+      [ "$fresh" = 0 ] || rm -rf "${STATE:?}/$name"
+      die "git clone failed"
+    fi
+  fi
+  bring_up "$name"
+}
+
+cmd_new() {
+  [ $# -eq 1 ] || usage
+  local name=$1
+  validate_name "$name"
+  claim "$name"
+  [ -n "$(sget "$name" source)" ] || sput "$name" source "(new)"
+  # Deliberately no `git init`, as in the NixOS sibling: run one yourself.
+  mkdir -p "$WORKSPACES/$name"
+  bring_up "$name"
+}
+
+cmd_rebuild() {
+  [ $# -eq 1 ] || usage
+  require_codespace "$1"
+  bring_up "$1" --remove-existing-container
+}
+
+cmd_down() {
+  [ $# -eq 1 ] || usage
+  require_codespace "$1"
+  local cid; cid=$(container_of "$1")
+  [ -n "$cid" ] || { note "$1 has no container"; return 0; }
+  docker stop "$cid" >/dev/null
+  note "$1 stopped (codespace up $1 to start it again)"
+}
+
+cmd_rm() {
+  local name="" repo=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo=1; shift ;;
+      -*) die "unknown option $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || usage
+  require_codespace "$name"
+  local cid; cid=$(container_of "$name")
+  if [ -n "$cid" ]; then
+    docker rm -f "$cid" >/dev/null
+    note "removed $name's container"
+  fi
+  if [ "$repo" = 1 ] && [ -d "$WORKSPACES/$name" ]; then
+    local reply
+    read -r -p "Delete the checkout $WORKSPACES/$name and everything in it? [y/N] " reply
+    if [ "$reply" = y ] || [ "$reply" = Y ]; then
+      rm -rf "${WORKSPACES:?}/$name" \
+        || die "could not delete every file in the checkout (some may be root-owned): sudo rm -rf $WORKSPACES/$name"
+      note "deleted the checkout"
+    fi
+  elif [ -d "$WORKSPACES/$name" ]; then
+    note "kept the checkout at $WORKSPACES/$name (--repo deletes it)"
+  fi
+  rm -rf "${STATE:?}/$name"
+}
+
+cmd_list() {
+  local d name
+  printf '%-24s %-8s %-9s %s\n' NAME PORT STATE SOURCE
+  for d in "$STATE"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    printf '%-24s %-8s %-9s %s\n' "$name" "$(sget "$name" port)" "$(container_status "$name")" "$(sget "$name" source)"
+  done
+}
+
+# A login shell in the workspace, inside the container.
+cmd_shell() {
+  [ $# -ge 1 ] || usage
+  local name=$1; shift
+  require_codespace "$name"
+  local cid; cid=$(container_of "$name")
+  [ "$(container_status "$name")" = running ] || die "$name is not running: codespace up $name"
+  local -a tty=(-i)
+  [ -t 0 ] && [ -t 1 ] && tty=(-it)
+  touch_used "$name"
+  local -a run=(docker exec "${tty[@]}" -u "$(sget "$name" remote_user)" -w "$(sget "$name" remote_folder)" "$cid")
+  if [ "${1:-}" = -- ]; then
+    shift
+    [ $# -gt 0 ] || die "nothing to run after --"
+    # One command line, run by a login shell, so it sees the same
+    # environment as a terminal does.
+    exec "${run[@]}" sh -lc "$*"
+  fi
+  # bash if the image has it, sh otherwise.
+  exec "${run[@]}" sh -c 'if command -v bash >/dev/null; then exec bash -l; else exec sh -l; fi'
+}
+
+cmd_logs() {
+  [ $# -eq 1 ] || usage
+  require_codespace "$1"
+  local cid; cid=$(container_of "$1")
+  [ -n "$cid" ] || die "$1 has no container"
+  echo "--- container (docker logs, last 50 lines)"
+  docker logs --tail 50 "$cid" 2>&1 || true
+  echo "--- editor (~/.codespace-editor.log, last 100 lines)"
+  docker exec -u "$(sget "$1" remote_user)" "$cid" sh -c 'tail -n 100 "$HOME/.codespace-editor.log"' 2>&1 || true
+}
+
+cmd_status() {
+  if [ $# -eq 1 ]; then
+    require_codespace "$1"
+    local port; port=$(sget "$1" port)
+    echo "name:      $1"
+    echo "source:    $(sget "$1" source)"
+    echo "container: $(container_status "$1")"
+    echo "port:      127.0.0.1:$port"
+    if editor_healthy "$port"; then echo "editor:    answering"; else echo "editor:    not answering"; fi
+    return 0
+  fi
+  require_docker
+  local avail floor root
+  read -r avail floor root < <(disk_check)
+  echo "mode:      $MODE ($(host_arch))"
+  echo "disk:      $((avail / 1024 / 1024 / 1024)) GiB free under $root, floor $((floor / 1024 / 1024 / 1024)) GiB"
+  echo "ports:     127.0.0.1:$PORT_BASE-$((PORT_BASE + PORT_COUNT - 1))"
+  echo "caps:      wanted $(slice_properties | tr '\n' ' ')"
+  local active; active=$(systemctl show "$SLICE" -p ActiveState --value 2>/dev/null || true)
+  echo "slice:     $SLICE ${active:-unknown}: MemoryMax=$(systemctl show "$SLICE" -p MemoryMax --value 2>/dev/null) TasksMax=$(systemctl show "$SLICE" -p TasksMax --value 2>/dev/null) CPUQuotaPerSecUSec=$(systemctl show "$SLICE" -p CPUQuotaPerSecUSec --value 2>/dev/null)"
+  if [ -r "/sys/fs/cgroup/$SLICE/memory.current" ]; then
+    echo "using:     $(( $(cat "/sys/fs/cgroup/$SLICE/memory.current") / 1024 / 1024 )) MiB RAM, $(cat "/sys/fs/cgroup/$SLICE/pids.current") tasks"
+  fi
+}
+
+# The tunnel to run on your PC. Built-in Windows OpenSSH understands both.
+cmd_tunnel() {
+  local names=() d forwards=() p host
+  if [ $# -eq 1 ]; then
+    require_codespace "$1"; names=("$1")
+  else
+    for d in "$STATE"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || die "no codespaces yet"
+  host=$(hostname -f 2>/dev/null || hostname)
+  for d in "${names[@]}"; do
+    p=$(sget "$d" port)
+    forwards+=("-L $p:127.0.0.1:$p")
+  done
+  echo "# On your PC (replace the host with however you reach this machine):"
+  echo "ssh -N ${forwards[*]} $(id -un)@$host"
+  echo
+  echo "# Or in ~/.ssh/config, then plain \`ssh $host\` opens them:"
+  echo "Host $host"
+  for d in "${names[@]}"; do
+    p=$(sget "$d" port)
+    echo "    LocalForward $p 127.0.0.1:$p    # $d"
+  done
+  echo
+  for d in "${names[@]}"; do echo "# $d: http://localhost:$(sget "$d" port)/"; done
+}
+
+cmd_setup() {
+  need_cmds curl tar xz sha256sum ss jq git sudo systemctl lsattr
+  local arch; arch=$(host_arch)
+  note "architecture: $arch"
+  require_docker
+  require_cgroup
+  note "docker: $(docker info --format '{{.ServerVersion}}'), cgroup driver systemd, cgroup v2"
+  mkdir -p "$APPS" "$STATE" "$WORKSPACES" "$REFS"
+
+  # Before we pull or build anything: uninstall and gc never remove an image
+  # that was here first (CLAUDE.md §5).
+  if [ ! -e "$STATE/preexisting-images" ]; then
+    docker images -q --no-trunc | sort -u > "$STATE/preexisting-images"
+    note "recorded $(wc -l < "$STATE/preexisting-images") pre-existing images"
+  fi
+
+  local t
+  for t in "${TOOLS[@]}"; do install_tool "$t"; done
+  write_shims
+  note "devcontainer CLI $("$BIN/devcontainer" --version)"
+
+  local avail floor root
+  read -r avail floor root < <(disk_check)
+  if [ "$avail" -lt "$floor" ]; then
+    warn "only $((avail / 1024 / 1024 / 1024)) GiB free under $root; up will refuse below $((floor / 1024 / 1024 / 1024)) GiB"
+  else
+    note "disk: $((avail / 1024 / 1024 / 1024)) GiB free under $root (floor $((floor / 1024 / 1024 / 1024)) GiB)"
+  fi
+  local p busy=()
+  for ((p = PORT_BASE; p < PORT_BASE + PORT_COUNT; p++)); do
+    port_in_use "$p" && busy+=("$p")
+  done
+  if [ ${#busy[@]} -gt 0 ]; then
+    warn "already in use on this host, so skipped: ${busy[*]} (or move PORT_BASE)"
+  fi
+  note "ports: 127.0.0.1:$PORT_BASE-$((PORT_BASE + PORT_COUNT - 1))"
+  note "caps (applied by up): $(slice_properties | tr '\n' ' ')"
+  note "setup done. Next: codespace up owner/repo"
 }
 
 not_yet() { die "'$1' is not implemented yet (Phase $2, CLAUDE.md §9)"; }
@@ -132,9 +755,19 @@ main() {
   esac
   load_config
   case "$cmd" in
-    setup|up|new|list|shell|down|rebuild|rm|logs|status|tunnel) not_yet "$cmd" 1 ;;
-    sync|ssh-auth)                                              not_yet "$cmd" 2 ;;
-    install-docker|update|gc|uninstall)                         not_yet "$cmd" 3 ;;
+    setup)   cmd_setup "$@" ;;
+    up)      cmd_up "$@" ;;
+    new)     cmd_new "$@" ;;
+    list)    cmd_list "$@" ;;
+    shell)   cmd_shell "$@" ;;
+    down)    cmd_down "$@" ;;
+    rebuild) cmd_rebuild "$@" ;;
+    rm)      cmd_rm "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    status)  cmd_status "$@" ;;
+    tunnel)  cmd_tunnel "$@" ;;
+    sync|ssh-auth)                      not_yet "$cmd" 2 ;;
+    install-docker|update|gc|uninstall) not_yet "$cmd" 3 ;;
     *) echo "codespace: unknown command '$cmd'" >&2; usage ;;
   esac
 }

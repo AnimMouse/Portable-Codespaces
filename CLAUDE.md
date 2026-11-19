@@ -88,9 +88,10 @@ Carried over from the NixOS sibling §8:
   into place by rename from a staging directory, then locked with `sudo find
   ! -type l -exec chattr +i`. Do not use `chattr -R`, because it fails on
   symlinks.
-- It is mounted into every container. The devcontainer CLI's `--mount` cannot
-  be read-only, and the immutable bit is what stops a compromised codespace
-  from planting an editor for the others.
+- It is mounted into every container at `/opt/code-server`. The devcontainer
+  CLI's `--mount` cannot be read-only, but the docker wrapper adds the mount
+  itself with `readonly` (Phase 1). The immutable bit stays as the second
+  lock: it holds even against a container that can remount.
 - `uninstall` clears the bit with `chattr -i` before deleting.
 
 ### Editors on `127.0.0.1:<PORT_BASE+n>`, reached only through an SSH tunnel
@@ -105,9 +106,10 @@ Carried over from the NixOS sibling §8:
 - `setup` and `up` refuse a port that something on the host already uses.
 - `codespace tunnel` prints the `ssh -L` line, or a `LocalForward` block for
   `~/.ssh/config`.
-- The devcontainer CLI cannot publish ports, so the editor is reached through
-  the container IP, as in the siblings. How exactly is decided in Phase 1
-  (§9), but the result must bind to loopback only.
+- The devcontainer CLI cannot publish ports, so **the docker wrapper adds
+  `--publish 127.0.0.1:<port>:13370` itself** (decided in Phase 1). code-server
+  listens on 13370 inside the container. `up` checks afterwards that this is
+  the container's only published port. No socat, no host-side process.
 
 ### GitHub auth: PAT and secrets files (the Sprites model)
 - Secrets come in three scopes, merged broadest first, with the narrower
@@ -202,8 +204,15 @@ Carried over from the NixOS sibling §8:
   | `PIDS_MAX` | finite | contains a fork bomb |
   | `OOM_SCORE_ADJ` | high, positive | when memory runs out across the host, the kernel kills codespaces before production |
 
-- The limits are set with `systemctl set-property --runtime` (or the matching
-  cgroupfs files), so they live in `/run` and nothing goes in `/etc`.
+- The limits are set with `systemctl set-property --runtime` on
+  `portablecodespaces.slice`, so they live in `/run` and nothing goes in
+  `/etc`. There's no dash in the name, because in systemd `a-b.slice` is a
+  child of `a.slice`.
+- Also `MemorySwapMax=0`: a codespace swapping under its cap would compete
+  with production for disk I/O. Over the cap, it is OOM-killed inside the
+  slice instead.
+- Docker must report the `systemd` cgroup driver on cgroup v2, or `setup` and
+  `up` refuse to run. The cgroupfs driver is not supported.
 - On the Pi, raise them in its config (for example `CPU_MAX=100%`,
   `MEM_MAX=75%`).
 - Disk-I/O weight is applied when the block device's scheduler honours it.
@@ -220,6 +229,36 @@ Carried over from the NixOS sibling §8:
   - the image's platform check
 - The repo's config is never edited, and the generated config doesn't need
   `runArgs`.
+- The wrapper also **refuses** anything in a repo's `devcontainer.json` that
+  would hand the container the host (Phase 1, from reading the devcontainer
+  CLI source):
+  - `--privileged`, `--device`, `--gpus`;
+  - dangerous capabilities (`SYS_ADMIN`, `ALL` and the like; `SYS_PTRACE`
+    stays allowed for debuggers);
+  - unconfined AppArmor/SELinux (`seccomp=unconfined` stays allowed, as it
+    is common next to `SYS_PTRACE`);
+  - host namespaces (`--pid/--ipc/--uts/--userns/--cgroupns host`) and any
+    `--network` but ours;
+  - bind mounts from outside the install's `data/`, above all
+    `/var/run/docker.sock`, which the docker-outside-of-docker feature
+    mounts;
+  - published ports (`appPort`, `-p`, `-P`), which would listen on
+    `0.0.0.0`. Use code-server's `/proxy/<port>/` instead;
+  - flags that would override ours (`--cgroup-parent`, `--oom-score-adj`,
+    `--pids-limit`, `--restart`);
+  - any `docker run` that is not this codespace's main container, any
+    `docker create`, and `docker compose` (compose-based configs are refused
+    by `up` before that, with a clear reason).
+
+  `ALLOW_HOST_ACCESS=1` (meant for the Pi) lets the privileged, device,
+  capability and bind-mount cases through. Published ports and our own flags
+  stay refused. `tests/wrapper.sh` has a case for every refusal.
+- Codespaces run on our own bridge network, `portable-codespaces`, with
+  inter-container traffic off. They don't share a network with production's
+  containers and cannot reach each other's editors. **Known gap:** a
+  codespace can still reach host services listening on `0.0.0.0`, through the
+  bridge gateway. Closing that needs a host firewall rule, which is global
+  state, so it is not done.
 - Verified at the end of every `up`: the container is in the right cgroup and
   carries the label. A container that missed the wrapper is stopped and
   reported, never left running uncapped.
@@ -278,6 +317,7 @@ is not needed.
 codespace                    CLI (bash): setup install-docker up new list shell down rebuild rm
                              logs status sync ssh-auth tunnel update gc uninstall
 lib/                         docker-wrapper, credential helper, in-container setup scripts
+tests/                       wrapper.sh: the wrapper's allow/refuse policy, no Docker needed
 manifest                     tool → version, url + sha256 for amd64 and arm64
 templates/devcontainer.json  default for repos without one (mcr devcontainers base:ubuntu, multi-arch)
 config.example
@@ -347,17 +387,28 @@ details.
   **public** repo, plus `tunnel`.
 - Tested on the Pi, then on one production VPS of each architecture.
 
-**Assumptions to verify in Phase 1, not trusted until tested:**
-- That `--docker-path` sees every `docker run`/`create` the devcontainer CLI
-  makes, including for Dockerfile- and compose-based configs.
-- Whether Ubuntu 24.04 and 26.04 `docker.io` use the `systemd` or `cgroupfs`
-  cgroup driver. It decides how the parent cgroup is named and limited.
-- That `--oom-score-adj` reaches the processes code-server and the lifecycle
-  commands start.
+**Settled from the devcontainer CLI 0.90.0 source (2026-11-19):**
+- It hands `docker` its own environment unchanged (`dockerEnv` is the CLI
+  host's `process.env`), so the wrapper reads `CODESPACE_*` variables.
+- It makes exactly one `docker run`, for the main container, carrying `-l
+  <id-label>`, and never `docker create`. Compose goes through `docker
+  compose`, which the wrapper cannot cap, so compose configs are refused.
+- `read-configuration` rejects `--no-lockfile`. Only `up` takes it.
+
+**Still to verify on a real host, not trusted until tested:**
+- That `systemctl set-property --runtime` works on a slice that doesn't exist
+  yet, and that docker's containers then land in it with the limits applied.
+  `up` reads the limits back and checks `/proc/<pid>/cgroup`, so a failure
+  stops it rather than running uncapped.
+- That Ubuntu 24.04 and 26.04 `docker.io` report `systemd 2`.
+- That `--oom-score-adj` reaches processes started with `docker exec`
+  (code-server, lifecycle commands).
 - Whether disk-I/O weighting has any effect on each host's disks.
-- That `chattr +i` works on each host's filesystem.
-- The loopback-only route to the editor, given the devcontainer CLI cannot
-  publish ports.
+- That `chattr +i` works on each host's filesystem. It fails in a container
+  without `CAP_LINUX_IMMUTABLE`, as in this dev container, and `setup` then
+  stops with a clear error.
+- That code-server's standalone build runs in the default image on both
+  architectures. It is glibc-only, so Alpine images will not work.
 
 ### Phase 2 — Identity
 - Secrets scopes, token resolution, the credential helper.
@@ -374,8 +425,9 @@ details.
 
 ## 10. Working agreements
 
-- Run `shellcheck -x codespace lib/*` before every commit. It must come out
-  clean.
+- Run `shellcheck -x codespace lib/* tests/*.sh` and `tests/wrapper.sh`
+  before every commit. Both must come out clean. A change to what the wrapper
+  allows or refuses gets a case in `tests/wrapper.sh`.
 - **Test against real hosts**, as the siblings do. This container cannot run
   the system. Say what was verified where, and never claim a cap works
   without measuring it (cgroup files, `docker inspect`, a load test).

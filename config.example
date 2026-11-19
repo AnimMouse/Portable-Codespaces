@@ -41,8 +41,19 @@
 
 # --- Boot ------------------------------------------------------------------
 # 0 (default): nothing of ours starts at boot; `codespace up <name>` brings a
-# codespace back. 1 restarts codespaces with the machine; meant for the Pi.
+# codespace back. 1 will restart codespaces with the machine, for the Pi, but
+# is refused for now: the caps live in /run and are gone after a reboot, and
+# Docker would restart the containers before anything puts them back.
 #AUTOSTART=0
+
+# --- What a repo's devcontainer.json may ask for ---------------------------
+# 0 (default): refused, because each gives the container the host:
+# --privileged, devices and GPUs, capabilities such as SYS_ADMIN, unconfined
+# AppArmor, and bind mounts from outside this folder (the docker socket above
+# all). 1 lets those through; meant for the Pi, never for production.
+# Published ports (appPort) stay refused either way; use the editor's
+# /proxy/<port>/ instead.
+#ALLOW_HOST_ACCESS=0
 
 # --- Codespaces --------------------------------------------------------------
 # Image for repos with no devcontainer.json (multi-arch: amd64 and arm64).

@@ -4,8 +4,9 @@ A GitHub Codespaces-like system for any Ubuntu VPS or Raspberry Pi. The whole
 install is one folder in `~`: clone it, run `codespace setup`, and open
 code-server editors in your browser through an SSH tunnel.
 
-> **Status: scaffold.** The design is settled ([CLAUDE.md](CLAUDE.md)); the
-> commands below are not implemented yet. See [HANDOFF.md](HANDOFF.md).
+> **Status: Phase 1 written, not yet run on a real host.** Host mode with
+> `setup`, `up`, `down`, `rm`, `list`, `shell`, `logs`, `status` and `tunnel`.
+> No secrets or dotfiles yet (Phase 2). See [HANDOFF.md](HANDOFF.md).
 
 This is the third sibling of
 [NixOS-Codespaces-VirtualBox](https://github.com/AnimMouse/NixOS-Codespaces-VirtualBox)
@@ -33,7 +34,7 @@ work, without disturbing it:
 - Editors listen on `127.0.0.1` only. Nothing starts at boot unless you ask.
 - `codespace uninstall` removes everything it created.
 
-## Setup (planned)
+## Setup
 
 You need Docker (`codespace install-docker` can install it from apt, with a
 warning) and sudo. Everything else is downloaded into the folder, pinned and

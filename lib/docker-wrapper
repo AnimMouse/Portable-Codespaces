@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 # docker-wrapper — the `docker` the devcontainer CLI is given (--docker-path).
 #
-# Passes everything through to the real docker, except that every container
-# the devcontainer CLI creates must carry our label and land in our capped
-# cgroup (CLAUDE.md §5): --label, --cgroup-parent, --oom-score-adj,
-# --pids-limit, and the image platform check.
+# Passes everything through to the real docker, except the one `docker run`
+# the devcontainer CLI makes (0.90.0: the main container; it never uses
+# `create`). That run is checked and given our caps (CLAUDE.md §5):
 #
-# Until that is written (Phase 1), `run` and `create` are refused. Failing
-# closed is the point: a container that misses the caps on a production host
-# is the one outcome §5 rules out.
+#   added    --label portable-codespaces=<name>, --cgroup-parent <our slice>,
+#            --oom-score-adj, --pids-limit, --network <our network>,
+#            --restart, the editor port on 127.0.0.1 only, and code-server
+#            mounted read-only at /opt/code-server
+#   refused  anything that would give the container the host: --privileged,
+#            dangerous capabilities, devices, unconfined security profiles,
+#            host namespaces, bind mounts from outside this install (the
+#            docker socket above all), published ports (appPort, -p, -P),
+#            and flags that would override ours
+#   checked  the image's architecture against the host's
+#
+# Everything comes from CODESPACE_* variables set by `codespace up`; the
+# devcontainer CLI hands its environment to docker unchanged. A run without
+# them, or for a different codespace, is refused: failing closed is the point,
+# because an uncapped container on a production host is what §5 rules out.
 
 set -euo pipefail
 
-# The real docker, never this script again. CODESPACE_DOCKER may name it
-# explicitly; otherwise the first `docker` on PATH that is not us.
+LABEL=portable-codespaces
+
+refuse() { echo "docker-wrapper: refused: $*" >&2; exit 1; }
+
+# The real docker, never this script again.
 real_docker() {
   local self d
-  self=$(readlink -f "$0")
   if [ -n "${CODESPACE_DOCKER:-}" ]; then echo "$CODESPACE_DOCKER"; return; fi
+  self=$(readlink -f "$0")
   while IFS= read -r d; do
     [ "$(readlink -f "$d")" = "$self" ] || { echo "$d"; return; }
   done < <(type -ap docker)
@@ -27,19 +41,204 @@ real_docker() {
 
 DOCKER=$(real_docker)
 
+# --- `docker run` option parsing --------------------------------------------
+# Options end at the first argument that is not one (the image); everything
+# after belongs to the container's command and is never inspected. A long
+# option takes a value unless it is in BOOL_LONG or written --opt=value; a
+# short cluster like -it is all flags unless it holds a value-taking letter.
+# An unknown option is assumed to take a value, which can only make the image
+# detection stop later, never let an option through unseen.
+BOOL_LONG=" --detach --interactive --tty --init --rm --privileged --publish-all
+  --read-only --no-healthcheck --oom-kill-disable --quiet --help
+  --sig-proxy --disable-content-trust "
+BOOL_SHORT="ditPq"
+
+# Parsed options, as parallel arrays of name (always the long or short form
+# as written, without a value) and value ("" for a flag).
+OPT_NAMES=()
+OPT_VALUES=()
+IMAGE=""
+
+parse_run() {
+  local a name
+  while [ $# -gt 0 ]; do
+    a=$1; shift
+    case "$a" in
+      --) IMAGE=${1:-}; return ;;
+      --*=*) OPT_NAMES+=("${a%%=*}"); OPT_VALUES+=("${a#*=}") ;;
+      --*)
+        if [[ "$BOOL_LONG" == *" $a "* ]]; then
+          OPT_NAMES+=("$a"); OPT_VALUES+=("")
+        else
+          [ $# -gt 0 ] || refuse "option $a has no value"
+          OPT_NAMES+=("$a"); OPT_VALUES+=("$1"); shift
+        fi
+        ;;
+      -?*)
+        local cluster=${a#-} i c
+        for ((i = 0; i < ${#cluster}; i++)); do
+          c=${cluster:i:1}
+          if [[ "$BOOL_SHORT" == *"$c"* ]]; then
+            OPT_NAMES+=("-$c"); OPT_VALUES+=("")
+          else
+            # A value-taking letter: the rest of the cluster is its value,
+            # or the next argument when nothing follows it.
+            name="-$c"
+            if [ $((i + 1)) -lt ${#cluster} ]; then
+              OPT_NAMES+=("$name"); OPT_VALUES+=("${cluster:i+1}")
+            else
+              [ $# -gt 0 ] || refuse "option $name has no value"
+              OPT_NAMES+=("$name"); OPT_VALUES+=("$1"); shift
+            fi
+            break
+          fi
+        done
+        ;;
+      *) IMAGE=$a; return ;;
+    esac
+  done
+}
+
+# Is a bind-mount source inside this install's data/ (or the editor's
+# directory)? Anything else on the host is refused: /var/run/docker.sock is
+# root on the host, and so is most of /.
+allowed_source() {
+  local src
+  src=$(realpath -m -- "$1")
+  case "$src/" in
+    "$CODESPACE_DATA"/*|"$CODESPACE_EDITOR_DIR"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Capabilities that amount to the host. SYS_PTRACE stays allowed: debuggers
+# need it, and many devcontainer.json files ask for it.
+DANGEROUS_CAPS=" ALL SYS_ADMIN SYS_MODULE SYS_RAWIO SYS_BOOT SYS_TIME DAC_READ_SEARCH
+  NET_ADMIN BPF PERFMON MAC_ADMIN MAC_OVERRIDE SYSLOG "
+
+check_run_options() {
+  local i n v cap src mount_type field
+  local -a fields
+  for i in "${!OPT_NAMES[@]}"; do
+    n=${OPT_NAMES[i]} v=${OPT_VALUES[i]}
+    case "$n" in
+      --privileged)
+        [ "${CODESPACE_ALLOW_HOST_ACCESS:-0}" = 1 ] || refuse "--privileged (a privileged container is root on this host; docker-in-docker is a non-goal, CLAUDE.md §4)" ;;
+      --cap-add)
+        cap=$(echo "${v#CAP_}" | tr '[:lower:]' '[:upper:]')
+        cap=${cap#CAP_}
+        if [[ "$DANGEROUS_CAPS" == *" $cap "* ]] && [ "${CODESPACE_ALLOW_HOST_ACCESS:-0}" != 1 ]; then
+          refuse "--cap-add $v"
+        fi ;;
+      --device|--device-cgroup-rule|--gpus)
+        [ "${CODESPACE_ALLOW_HOST_ACCESS:-0}" = 1 ] || refuse "$n $v (host devices)" ;;
+      --security-opt)
+        case "$v" in
+          *unconfined*|label=disable|label:disable|systempaths=*)
+            # seccomp=unconfined is common next to SYS_PTRACE in Go and C++
+            # templates; it widens the kernel surface but grants nothing
+            # directly, so only apparmor and the rest are refused.
+            case "$v" in seccomp=unconfined|seccomp:unconfined) ;; *)
+              [ "${CODESPACE_ALLOW_HOST_ACCESS:-0}" = 1 ] || refuse "--security-opt $v" ;;
+            esac ;;
+        esac ;;
+      --pid|--ipc|--uts|--userns|--cgroupns)
+        [ "$v" != host ] || refuse "$n host (the host's namespace)" ;;
+      --network|--net)
+        [ "$v" = "$CODESPACE_NETWORK" ] || refuse "$n $v (codespaces use their own network, $CODESPACE_NETWORK)" ;;
+      -p|--publish|-P|--publish-all)
+        refuse "$n $v: published ports would listen beyond this codespace's editor port. Remove appPort/-p from devcontainer.json and use the editor's /proxy/<port>/ instead" ;;
+      --expose) ;;
+      --cgroup-parent|--oom-score-adj|--pids-limit|--restart)
+        refuse "$n $v (set by Portable-Codespaces itself, CLAUDE.md §5)" ;;
+      --volumes-from)
+        refuse "$n $v (another container's volumes)" ;;
+      -v|--volume)
+        # src:dst[:opts]. A source starting with / or . is a host path; any
+        # other is a named volume, which stays inside docker.
+        src=${v%%:*}
+        case "$src" in
+          /*|.*) allowed_source "$src" || refuse "$n $v (host path outside this install)" ;;
+        esac ;;
+      --mount)
+        mount_type=volume src=""
+        IFS=, read -ra fields <<< "$v"
+        for field in "${fields[@]}"; do
+          case "$field" in
+            type=*) mount_type=${field#type=} ;;
+            source=*|src=*) src=${field#*=} ;;
+          esac
+        done
+        if [ "$mount_type" = bind ]; then
+          [ -n "$src" ] || refuse "--mount $v (bind mount without a source)"
+          allowed_source "$src" || refuse "--mount $v (host path outside this install)"
+        fi ;;
+    esac
+  done
+}
+
+# Does this run carry the devcontainer CLI's id label for our codespace?
+# `codespace up` passes --id-label portable-codespaces=<name>.
+has_id_label() {
+  local i
+  for i in "${!OPT_NAMES[@]}"; do
+    case "${OPT_NAMES[i]}" in
+      -l|--label) [ "${OPT_VALUES[i]}" = "$LABEL=$CODESPACE_NAME" ] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+check_platform() {
+  local arch
+  # Built or pulled by the devcontainer CLI before the run; when it is not
+  # there, docker's own pull reports the mismatch.
+  arch=$("$DOCKER" image inspect --format '{{.Architecture}}' "$IMAGE" 2>/dev/null) || return 0
+  [ "$arch" = "$CODESPACE_ARCH" ] \
+    || refuse "image $IMAGE is $arch, this host is $CODESPACE_ARCH (no emulation, CLAUDE.md §2)"
+}
+
+wrap_run() {
+  local v
+  for v in CODESPACE_NAME CODESPACE_PORT CODESPACE_EDITOR_PORT CODESPACE_CGROUP_PARENT \
+           CODESPACE_OOM_SCORE_ADJ CODESPACE_PIDS_MAX CODESPACE_NETWORK CODESPACE_RESTART \
+           CODESPACE_EDITOR_DIR CODESPACE_DATA CODESPACE_ARCH; do
+    [ -n "${!v:-}" ] || refuse "docker run outside \`codespace up\` ($v is not set)"
+  done
+  parse_run "$@"
+  [ -n "$IMAGE" ] || refuse "docker run without an image"
+  has_id_label || refuse "a docker run that is not codespace $CODESPACE_NAME's main container"
+  check_run_options
+  check_platform
+
+  exec "$DOCKER" run \
+    --label "$LABEL=$CODESPACE_NAME" \
+    --cgroup-parent "$CODESPACE_CGROUP_PARENT" \
+    --oom-score-adj "$CODESPACE_OOM_SCORE_ADJ" \
+    --pids-limit "$CODESPACE_PIDS_MAX" \
+    --network "$CODESPACE_NETWORK" \
+    --restart "$CODESPACE_RESTART" \
+    --publish "127.0.0.1:$CODESPACE_PORT:$CODESPACE_EDITOR_PORT" \
+    --mount "type=bind,source=$CODESPACE_EDITOR_DIR,target=/opt/code-server,readonly" \
+    "$@"
+}
+
 case "${1:-}" in
-  run|create)
-    echo "docker-wrapper: '$1' is refused until the caps are implemented (Phase 1)" >&2
-    exit 1
-    ;;
+  run) shift; wrap_run "$@" ;;
+  create) refuse "docker create (the devcontainer CLI is expected to use run)" ;;
   container)
     case "${2:-}" in
-      run|create)
-        echo "docker-wrapper: 'container $2' is refused until the caps are implemented (Phase 1)" >&2
-        exit 1
-        ;;
-    esac
-    ;;
+      run) shift 2; wrap_run "$@" ;;
+      create) refuse "docker container create" ;;
+    esac ;;
+  compose)
+    # Compose creates containers the wrapper never sees, so they would run
+    # uncapped. Only the CLI's version probe is let through; `codespace up`
+    # refuses compose-based configs before getting here.
+    case "${2:-}" in
+      version) ;;
+      *) refuse "docker compose (compose-based devcontainer.json is not supported yet)" ;;
+    esac ;;
 esac
 
 exec "$DOCKER" "$@"
